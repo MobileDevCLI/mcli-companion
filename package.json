@@ -1,0 +1,41 @@
+{
+  "name": "mcli-companion",
+  "version": "1.0.0",
+  "description": "Local runtime for mcli.mobilecli.com — hosts your Claude Code / Codex / Gemini CLI as a WebSocket that the browser tab talks to.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "gemini",
+    "cli",
+    "companion",
+    "websocket",
+    "mobilecli"
+  ],
+  "homepage": "https://mcli.mobilecli.com",
+  "bugs": {
+    "url": "https://github.com/MobileDevCLI/mcli-companion/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MobileDevCLI/mcli-companion.git"
+  },
+  "author": "Robert / MobileDevCLI <mobiledevcli@gmail.com>",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "mcli-companion": "bin/mcli-companion.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

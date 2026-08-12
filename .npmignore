@@ -1,0 +1,17 @@
+node_modules/
+.git/
+.gitignore
+*.log
+*.tgz
+.DS_Store
+test/
+tests/
+__tests__/
+*.test.js
+*.spec.js
+.env
+.env.*
+package-lock.json
+.npmrc
+.vscode/
+.idea/
