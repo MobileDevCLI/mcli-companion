@@ -1,6 +1,6 @@
 {
   "name": "mcli-companion",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Local runtime for mcli.mobilecli.com — hosts your Claude Code / Codex / Gemini CLI as a WebSocket that the browser tab talks to.",
   "keywords": [
     "claude",
