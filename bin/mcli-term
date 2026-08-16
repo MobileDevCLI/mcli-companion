@@ -61,8 +61,16 @@ function stopPid(pidFile) {
   if (!isAlive(pidFile)) { try { fs.unlinkSync(pidFile); } catch {} return; }
   const pid = readPid(pidFile);
   log(`stopping pid ${pid} (${path.basename(pidFile)})`);
-  try { process.kill(pid, 'SIGTERM'); } catch {}
-  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} }, 300);
+  // Kill the entire process group so wrappers (proot cloudflared) take
+  // their children down too. `detached: true` at spawn time makes each
+  // child a session leader, so `kill(-pid)` targets the whole group.
+  const killGroup = (sig) => {
+    try { process.kill(-pid, sig); } catch {
+      try { process.kill(pid, sig); } catch {}
+    }
+  };
+  killGroup('SIGTERM');
+  setTimeout(() => killGroup('SIGKILL'), 300);
   try { fs.unlinkSync(pidFile); } catch {}
 }
 function stopAll() {
@@ -163,6 +171,36 @@ async function startCompanion() {
   }
 }
 
+// Termux DNS wrapper: Go's stdlib resolver reads /etc/resolv.conf, which does
+// not exist on Android. curl/python use $PREFIX/etc/resolv.conf, but Go binaries
+// like cloudflared don't. Bind-mount via proot (no root required) so the tunnel
+// can actually resolve api.trycloudflare.com. Detected once: proot binary
+// present AND /etc/resolv.conf missing/unreadable.
+function buildTunnelCmd(cfArgs) {
+  // Non-shell check for proot on PATH so we don't trip the DEP0190 warning.
+  const findOnPath = (name) => {
+    for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+      if (!dir) continue;
+      const p = path.join(dir, name);
+      try { fs.accessSync(p, fs.constants.X_OK); return p; } catch {}
+    }
+    return '';
+  };
+  const prootBin = findOnPath('proot');
+  const prefixResolv = process.env.PREFIX
+    ? path.join(process.env.PREFIX, 'etc', 'resolv.conf')
+    : '';
+  const hasEtcResolv = (() => {
+    try { fs.accessSync('/etc/resolv.conf', fs.constants.R_OK); return true; }
+    catch { return false; }
+  })();
+  const needsBind = prootBin && prefixResolv && fs.existsSync(prefixResolv) && !hasEtcResolv;
+  if (needsBind) {
+    return { cmd: prootBin, args: ['-b', `${prefixResolv}:/etc/resolv.conf`, 'cloudflared', ...cfArgs] };
+  }
+  return { cmd: 'cloudflared', args: cfArgs };
+}
+
 async function startTunnel() {
   const cf = spawnSync('cloudflared', ['--version'], { encoding: 'utf8' });
   if (cf.status !== 0) die('cloudflared not installed. install: pkg install cloudflared  (Termux) or see https://github.com/cloudflare/cloudflared/releases');
@@ -174,24 +212,56 @@ async function startTunnel() {
   log(`starting cloudflared quick-tunnel → ${HOST}:${PORT}`);
   fs.writeFileSync(TUNNEL_LOG, '');
   const out = fs.openSync(TUNNEL_LOG, 'a');
-  const child = spawn('cloudflared', ['tunnel', '--no-autoupdate', '--url', `http://${HOST}:${PORT}`], {
-    detached: true, stdio: ['ignore', out, out],
-  });
+  const cfArgs = ['tunnel', '--no-autoupdate', '--url', `http://${HOST}:${PORT}`];
+  const { cmd, args } = buildTunnelCmd(cfArgs);
+  if (cmd === 'proot') log(`(Termux) wrapping cloudflared in proot for /etc/resolv.conf`);
+  const child = spawn(cmd, args, { detached: true, stdio: ['ignore', out, out] });
   fs.writeFileSync(TUNNEL_PID, String(child.pid));
   child.unref();
-  // Scrape the URL from log
+  // Scrape the URL from the log. Must be a SUBDOMAIN of trycloudflare.com,
+  // NOT api.trycloudflare.com (which appears in cloudflared's error messages
+  // when DNS or account lookup fails — earlier versions of this scraper
+  // would happily "succeed" on that false-positive).
   let url = '';
   try {
     url = await waitFor(() => {
       const s = fs.readFileSync(TUNNEL_LOG, 'utf8');
-      const m = s.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-      return m ? m[0] : null;
-    }, 60, 300);
+      // Extract every candidate, then filter out api.* and take the first real one.
+      const all = s.match(/https:\/\/[a-z0-9-]+(?:-[a-z0-9]+)*\.trycloudflare\.com/gi) || [];
+      const real = all.find(u => !/^https:\/\/api\./i.test(u));
+      return real || null;
+    }, 90, 400);
   } catch {}
-  if (!url) { warn(`tunnel URL not yet in log — check ${TUNNEL_LOG}`); return; }
+  if (!url) {
+    // Surface whatever cloudflared said so failures are debuggable.
+    const tail = fs.readFileSync(TUNNEL_LOG, 'utf8').split('\n').slice(-6).join('\n');
+    warn(`tunnel URL not yet in log — check ${TUNNEL_LOG}\n${tail}`);
+    return;
+  }
+  // Health-check the tunnel URL before declaring success. cloudflared logs
+  // the URL when it's *provisioned*, not when it's *reachable* — give it
+  // up to 15s to serve a 401 (token required) or 200.
+  const probeUrl = url + (token ? `/?t=${encodeURIComponent(token)}` : '/');
+  let reachable = false;
+  for (let i = 0; i < 30; i++) {
+    try {
+      const status = await new Promise((resolve) => {
+        const req = require('node:https').get(probeUrl, { timeout: 3000 }, (res) => {
+          resolve(res.statusCode); res.resume();
+        });
+        req.on('error', () => resolve(0));
+        req.on('timeout', () => { req.destroy(); resolve(0); });
+      });
+      if (status === 200 || status === 401) { reachable = true; break; }
+    } catch {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+  if (!reachable) {
+    warn(`tunnel URL ${url} did not respond within 15s — traffic may still start soon`);
+  }
   const pub = urlWithArgs(url + '/');
   fs.writeFileSync(TUNNEL_URL_F, pub);
-  ok(`public: ${pub}`);
+  ok(`public: ${pub}${reachable ? '' : '  (not yet reachable)'}`);
 }
 
 (async () => {
