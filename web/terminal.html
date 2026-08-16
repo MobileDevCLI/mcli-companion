@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>MobileCLI Terminal</title>
+<link rel="stylesheet" href="/assets/xterm.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0d1117; color: #d4d4d4;
+    font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    -webkit-text-size-adjust: 100%; overflow: hidden; }
+  #bar { position: fixed; top: 0; left: 0; right: 0; height: 34px; z-index: 10;
+    display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    background: rgba(13, 17, 23, 0.95); border-bottom: 1px solid #30363d;
+    font-size: 12px; box-sizing: border-box; }
+  #bar select, #bar button { background: #21262d; color: #d4d4d4; border: 1px solid #30363d;
+    border-radius: 4px; padding: 4px 8px; font-size: 12px; font-family: inherit; }
+  #bar button { cursor: pointer; }
+  #bar button:hover { background: #30363d; }
+  #bar .status { flex: 1; color: #7d8590; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #bar .status.ok { color: #3fb950; }
+  #bar .status.err { color: #f85149; }
+  #host { position: fixed; top: 34px; left: 0; right: 0; bottom: 0; padding: 4px; }
+  #term { width: 100%; height: 100%; }
+  /* Mobile IME fix — Wetty pattern + xterm.js maintainer recommendation.
+     Override xterm's default helper textarea so it's a full-viewport
+     transparent overlay that Android GBoard + iOS Safari IME recognize
+     as a real editor. font-size:16px blocks iOS auto-zoom on focus. */
+  #term .xterm-helper-textarea {
+    position: absolute !important;
+    top: 0 !important; left: 0 !important;
+    width: 100% !important; height: 100% !important;
+    opacity: 0 !important;
+    z-index: 5 !important;
+    pointer-events: auto !important;
+    caret-color: transparent;
+    -webkit-user-select: text; user-select: text;
+    font-size: 16px !important;
+    border: 0; padding: 0; margin: 0; background: transparent; resize: none;
+  }
+  #term .xterm-screen { touch-action: manipulation; }
+  /* Splash overlay before spawn */
+  #splash { position: fixed; inset: 0; z-index: 20; display: flex;
+    align-items: center; justify-content: center; flex-direction: column; gap: 12px;
+    background: rgba(13, 17, 23, 0.98); }
+  #splash h1 { margin: 0; font-size: 20px; color: #58a6ff; }
+  #splash p { margin: 0; color: #7d8590; font-size: 13px; text-align: center; max-width: 320px; }
+  #splash .row { display: flex; gap: 8px; }
+  #splash button { background: #238636; color: white; border: 0; border-radius: 6px;
+    padding: 10px 16px; font-size: 14px; cursor: pointer; font-family: inherit; }
+  #splash button.alt { background: #21262d; color: #d4d4d4; border: 1px solid #30363d; }
+  #splash select { background: #21262d; color: #d4d4d4; border: 1px solid #30363d;
+    border-radius: 6px; padding: 10px 12px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="whichBin">—</span>
+  <button id="btnRespawn" title="Kill + restart current CLI">↻</button>
+  <button id="btnKbd" title="Focus keyboard">⌨</button>
+  <span class="status" id="status">idle</span>
+  <button id="btnPick" title="Pick different CLI">CLI</button>
+</div>
+<div id="host"><div id="term"></div></div>
+<div id="splash">
+  <h1>MobileCLI Terminal</h1>
+  <p>Pick a CLI to spawn. Runs on the machine hosting this companion, under your own login.</p>
+  <select id="binSelect"></select>
+  <div class="row">
+    <button id="btnStart">Start</button>
+    <button class="alt" id="btnBash">Bash shell</button>
+  </div>
+  <p id="splashInfo" style="font-size: 11px;"></p>
+</div>
+
+<script src="/assets/xterm.js"></script>
+<script src="/assets/xterm-addon-fit.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  const setStatus = (msg, cls = '') => {
+    statusEl.textContent = msg;
+    statusEl.className = 'status ' + cls;
+  };
+
+  // Parse ?bin=claude and ?t=<token>
+  const qs = new URLSearchParams(location.search);
+  const initialBin = qs.get('bin') || null;
+  const authToken = qs.get('t') || '';
+
+  // ── Build the xterm ────────────────────────────────────────────────
+  const term = new Terminal({
+    cursorBlink: true, convertEol: false, scrollback: 5000,
+    fontFamily: 'ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace',
+    fontSize: 13,
+    theme: { background: '#0d1117', foreground: '#d4d4d4', cursor: '#58a6ff',
+             selectionBackground: '#30363d' },
+    allowProposedApi: false,
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($('term'));
+  try { fit.fit(); } catch {}
+
+  // Mobile IME fix — the Wetty + xterm.js #5108 workaround.
+  //
+  // Root cause: xterm's helper textarea (1×1, opacity 0) gets treated by
+  // Android GBoard as "not really an editor" — text buffers until double-Enter.
+  // Fix: make it a full-viewport overlay AND make .xterm-screen contenteditable
+  // AND listen for `beforeinput` (fires per-keystroke on GBoard even when
+  // keydown is keyCode 229/Unidentified) AND route bytes through the
+  // undocumented-but-stable `_core.coreService.triggerDataEvent` API.
+  function attachMobileInput(term, container) {
+    const ta = container.querySelector('.xterm-helper-textarea');
+    const screen = container.querySelector('.xterm-screen');
+    if (!ta) return;
+
+    if (screen) {
+      screen.setAttribute('contenteditable', 'true');
+      ['spellcheck','autocorrect','autocomplete','autocapitalize']
+        .forEach(a => screen.setAttribute(a, 'false'));
+    }
+
+    let composing = false;
+    let lastValue = '';
+
+    const emit = (data) => {
+      try { term._core.coreService.triggerDataEvent(data, true); }
+      catch { term.paste(data); }  // safety net if _core internal ever moves
+    };
+
+    ta.addEventListener('compositionstart', () => { composing = true; });
+    ta.addEventListener('compositionend', (e) => {
+      composing = false;
+      if (e.data) emit(e.data);
+      ta.value = ''; lastValue = '';
+    });
+
+    ta.addEventListener('beforeinput', (e) => {
+      if (composing) return;
+      const t = e.inputType;
+      if (t === 'insertText' && e.data) { emit(e.data); e.preventDefault(); }
+      else if (t === 'deleteContentBackward') { emit('\x7f'); e.preventDefault(); }
+      else if (t === 'insertLineBreak' || t === 'insertParagraph') { emit('\r'); e.preventDefault(); }
+      ta.value = ''; lastValue = '';
+    });
+
+    ta.addEventListener('input', () => {
+      if (composing) return;
+      const v = ta.value;
+      if (v && v !== lastValue) {
+        const diff = v.slice(lastValue.length);
+        if (diff) emit(diff);
+        ta.value = ''; lastValue = '';
+      }
+    });
+
+    // Refocus on any tap so the software keyboard reopens
+    container.addEventListener('touchend', () => { try { ta.focus(); } catch {} }, { passive: true });
+    container.addEventListener('click',    () => { try { ta.focus(); } catch {} });
+    // Refocus when tab becomes visible after app-switch
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') { try { ta.focus(); } catch {} }
+    });
+  }
+  attachMobileInput(term, $('term'));
+
+  // Refit on viewport change (mobile keyboard opens → visualViewport shrinks)
+  const doFit = () => { try { fit.fit(); } catch {} };
+  window.addEventListener('resize', doFit);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', doFit);
+  }
+
+  // ── WebSocket to the companion ────────────────────────────────────
+  const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsScheme}//${location.host}${authToken ? '?t=' + encodeURIComponent(authToken) : ''}`;
+
+  let ws = null;
+  let sessionId = null;
+  let spawned = false;
+  let queue = [];
+  let hello = null;
+  let keepaliveTimer = null;
+
+  const b64encode = (u8) => {
+    let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+    return btoa(s);
+  };
+  const b64decode = (str) => {
+    const bin = atob(str);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  };
+
+  const send = (obj) => {
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+    }
+    return false;
+  };
+
+  const wireTerm = () => {
+    // xterm data (from onData) → PTY stdin
+    term.onData((data) => {
+      const bytes = new TextEncoder().encode(data);
+      const payload = { type: 'pty_write', id: sessionId, data: b64encode(bytes) };
+      if (!send(payload)) queue.push(payload);
+    });
+    term.onResize(({ cols, rows }) => {
+      send({ type: 'pty_resize', id: sessionId, cols, rows });
+    });
+  };
+
+  const openWs = () => new Promise((resolve, reject) => {
+    setStatus('connecting…');
+    let opened = false;
+    try { ws = new WebSocket(wsUrl); }
+    catch (e) { return reject(e); }
+
+    const timeout = setTimeout(() => {
+      if (!opened) { try { ws.close(); } catch {} reject(new Error('ws timeout')); }
+    }, 8000);
+
+    ws.onopen = () => { opened = true; clearTimeout(timeout); setStatus('connected', 'ok'); resolve(); };
+    ws.onerror = () => { clearTimeout(timeout); if (!opened) reject(new Error('ws error')); };
+    ws.onclose = () => {
+      setStatus('disconnected', 'err');
+      spawned = false;
+      if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+    };
+    ws.onmessage = (ev) => onMsg(ev);
+  });
+
+  // Coalesce pty_data writes to one per animation frame (avoid mobile Chrome thrash)
+  let writeBuf = [];
+  let flushScheduled = false;
+  const flush = () => {
+    flushScheduled = false;
+    if (!writeBuf.length) return;
+    let total = 0; for (const b of writeBuf) total += b.length;
+    const merged = new Uint8Array(total);
+    let off = 0; for (const b of writeBuf) { merged.set(b, off); off += b.length; }
+    writeBuf = [];
+    try { term.write(merged); } catch {}
+  };
+
+  const onMsg = (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    switch (msg.type) {
+      case 'hello':
+        hello = msg;
+        renderBinList(msg.installed || {});
+        $('splashInfo').textContent = `companion v${msg.version || '?'} · ${msg.platform || ''} · node ${msg.node || ''}`;
+        break;
+      case 'pty_spawned':
+        spawned = true;
+        sessionId = msg.id;
+        $('whichBin').textContent = msg.bin || '';
+        setStatus(`PID ${msg.pid}`, 'ok');
+        for (const q of queue) send(q);
+        queue = [];
+        try { term.focus(); const ta = $('term').querySelector('.xterm-helper-textarea'); ta && ta.focus(); } catch {}
+        break;
+      case 'pty_data':
+        if (msg.id && msg.id !== sessionId) return;
+        writeBuf.push(b64decode(msg.data));
+        if (!flushScheduled) { flushScheduled = true; requestAnimationFrame(flush); }
+        break;
+      case 'pty_exit':
+        setStatus(`exit ${msg.code ?? '?'}`, 'err');
+        spawned = false;
+        term.write('\r\n\x1b[2m[session ended]\x1b[0m\r\n');
+        break;
+      case 'install_progress':
+        term.write(`\x1b[2m${msg.line}\x1b[0m\r\n`);
+        break;
+      case 'error':
+        setStatus(`error: ${msg.error}`, 'err');
+        term.write(`\r\n\x1b[31m[error] ${msg.error}\x1b[0m\r\n`);
+        break;
+    }
+  };
+
+  const spawnBin = (bin) => {
+    sessionId = 'pty_' + Math.random().toString(36).slice(2, 10);
+    wireTerm();
+    const { cols, rows } = term;
+    send({ type: 'pty_spawn', id: sessionId, bin, args: [], cols, rows });
+    $('splash').style.display = 'none';
+    // Kick keepalive
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = setInterval(() => send({ type: 'ping', ts: Date.now() }), 25000);
+  };
+
+  const renderBinList = (installed) => {
+    const sel = $('binSelect');
+    sel.innerHTML = '';
+    const preferred = ['claude', 'codex', 'gemini', 'grok', 'gh', 'bash', 'sh', 'node', 'python', 'git'];
+    for (const bin of preferred) {
+      const opt = document.createElement('option');
+      opt.value = bin;
+      opt.textContent = bin + (installed[bin] ? '' : ' (not installed)');
+      if (!installed[bin]) opt.disabled = true;
+      sel.appendChild(opt);
+    }
+    // Preselect first-installed
+    for (const bin of preferred) if (installed[bin]) { sel.value = bin; break; }
+    if (initialBin && installed[initialBin]) sel.value = initialBin;
+  };
+
+  // ── Boot ────────────────────────────────────────────────────────────
+  (async () => {
+    try { await openWs(); }
+    catch (e) { setStatus(`failed: ${e.message}`, 'err'); return; }
+    // Wait for hello, then either auto-spawn from ?bin= or show splash.
+    setTimeout(() => {
+      if (initialBin && hello && hello.installed && hello.installed[initialBin]) {
+        spawnBin(initialBin);
+      }
+    }, 200);
+  })();
+
+  // Splash buttons
+  $('btnStart').onclick = () => spawnBin($('binSelect').value);
+  $('btnBash').onclick  = () => spawnBin('bash');
+  $('btnRespawn').onclick = () => {
+    if (sessionId) send({ type: 'pty_kill', id: sessionId, sig: 'SIGTERM' });
+    setTimeout(() => spawnBin($('binSelect').value || $('whichBin').textContent || 'bash'), 300);
+  };
+  $('btnKbd').onclick = () => {
+    try { const ta = $('term').querySelector('.xterm-helper-textarea'); ta && ta.focus(); } catch {}
+  };
+  $('btnPick').onclick = () => {
+    if (sessionId) send({ type: 'pty_kill', id: sessionId, sig: 'SIGTERM' });
+    $('splash').style.display = 'flex';
+  };
+})();
+</script>
+</body>
+</html>

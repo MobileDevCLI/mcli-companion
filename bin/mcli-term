@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+// mcli-term — one-command browser terminal launcher.
+//
+// Starts mcli-companion (WebSocket + self-hosted xterm UI at localhost:8127)
+// and optionally opens a Cloudflare public tunnel so any device on any
+// network can reach the same terminal.
+//
+// Usage:
+//   mcli-term                  # local terminal at http://localhost:8127
+//   mcli-term claude           # same, auto-spawn claude on connect
+//   mcli-term --tunnel         # + start cloudflared quick-tunnel; prints public URL
+//   mcli-term --tunnel claude  # tunnel + auto-spawn claude
+//   mcli-term --stop           # stop companion + tunnel started by mcli-term
+//   mcli-term --status         # show URLs + pids
+//
+// Env:
+//   MCLI_COMPANION_PORT    default 8127
+//   MCLI_COMPANION_HOST    default 127.0.0.1  (use 0.0.0.0 to accept LAN)
+//   MCLI_COMPANION_TOKEN   set to require ?t=<token>; auto-generated for --tunnel
+//
+// The tunnel URL is public — token auth is FORCED when --tunnel is passed.
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const { spawn, spawnSync } = require('node:child_process');
+const http = require('node:http');
+const crypto = require('node:crypto');
+
+const REPO = path.resolve(__dirname, '..');
+const STATE_DIR = process.env.MCLI_TERM_STATE || path.join(os.homedir(), '.mcli-term');
+fs.mkdirSync(STATE_DIR, { recursive: true });
+const COMPANION_PID = path.join(STATE_DIR, 'companion.pid');
+const TUNNEL_PID    = path.join(STATE_DIR, 'tunnel.pid');
+const TUNNEL_URL_F  = path.join(STATE_DIR, 'tunnel.url');
+const TOKEN_FILE    = path.join(STATE_DIR, 'token');
+const COMPANION_LOG = path.join(STATE_DIR, 'companion.log');
+const TUNNEL_LOG    = path.join(STATE_DIR, 'tunnel.log');
+
+const C = { c:'\x1b[36m', g:'\x1b[32m', y:'\x1b[33m', r:'\x1b[31m', d:'\x1b[2m', x:'\x1b[0m' };
+const log  = (...a) => console.error(`${C.c}[mcli-term]${C.x}`, ...a);
+const ok   = (...a) => console.error(`${C.g}[mcli-term]${C.x}`, ...a);
+const warn = (...a) => console.error(`${C.y}[mcli-term]${C.x}`, ...a);
+const die  = (m) => { console.error(`${C.r}[mcli-term]${C.x} ${m}`); process.exit(1); };
+
+function isAlive(pidFile) {
+  try {
+    if (!fs.existsSync(pidFile)) return false;
+    const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+    if (!pid) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch { return false; }
+}
+function readPid(pidFile) {
+  try { return parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10); } catch { return 0; }
+}
+function stopPid(pidFile) {
+  if (!isAlive(pidFile)) { try { fs.unlinkSync(pidFile); } catch {} return; }
+  const pid = readPid(pidFile);
+  log(`stopping pid ${pid} (${path.basename(pidFile)})`);
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} }, 300);
+  try { fs.unlinkSync(pidFile); } catch {}
+}
+function stopAll() {
+  stopPid(TUNNEL_PID);
+  stopPid(COMPANION_PID);
+  try { fs.unlinkSync(TUNNEL_URL_F); } catch {}
+  ok('stopped');
+}
+
+function showHelp() {
+  console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(3, 22).join('\n').replace(/^\/\/ ?/gm, ''));
+}
+
+// ── Args ───────────────────────────────────────────────────────────────
+let useTunnel = false;
+let autoBin = '';
+for (const a of process.argv.slice(2)) {
+  if (a === '--tunnel' || a === '-t') useTunnel = true;
+  else if (a === '--stop' || a === 'stop') { stopAll(); process.exit(0); }
+  else if (a === '--status' || a === 'status') {}   // handled below
+  else if (a === '--help' || a === '-h') { showHelp(); process.exit(0); }
+  else if (a.startsWith('-')) die(`unknown flag: ${a}`);
+  else autoBin = a;
+}
+const statusMode = process.argv.slice(2).some(a => a === '--status' || a === 'status');
+
+const PORT = Number(process.env.MCLI_COMPANION_PORT || 8127);
+const HOST = process.env.MCLI_COMPANION_HOST || '127.0.0.1';
+
+// ── Token auto-gen for tunnel path ────────────────────────────────────
+let token = process.env.MCLI_COMPANION_TOKEN || '';
+if (useTunnel && !token) {
+  if (fs.existsSync(TOKEN_FILE)) {
+    token = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+  } else {
+    token = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+  }
+}
+
+function urlWithArgs(base) {
+  const u = new URL(base);
+  if (autoBin) u.searchParams.set('bin', autoBin);
+  if (token)   u.searchParams.set('t', token);
+  return u.toString();
+}
+
+function waitFor(fn, tries, delayMs) {
+  return new Promise((resolve, reject) => {
+    let n = 0;
+    const tick = () => {
+      Promise.resolve(fn()).then((v) => {
+        if (v) return resolve(v);
+        if (++n >= tries) return reject(new Error('timed out'));
+        setTimeout(tick, delayMs);
+      }, (e) => {
+        if (++n >= tries) return reject(e);
+        setTimeout(tick, delayMs);
+      });
+    };
+    tick();
+  });
+}
+
+function probeCompanion() {
+  return new Promise((resolve) => {
+    const opts = { host: HOST, port: PORT, path: token ? `/?t=${encodeURIComponent(token)}` : '/', method: 'GET', timeout: 1000 };
+    const req = http.request(opts, (res) => { resolve(res.statusCode === 200); res.resume(); });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+async function startCompanion() {
+  if (isAlive(COMPANION_PID)) {
+    ok(`companion already running (pid ${readPid(COMPANION_PID)})`);
+    return;
+  }
+  log(`starting companion on ${HOST}:${PORT}`);
+  const env = {
+    ...process.env,
+    MCLI_COMPANION_HOST: HOST,
+    MCLI_COMPANION_PORT: String(PORT),
+    MCLI_COMPANION_TOKEN: token || '',
+  };
+  const out = fs.openSync(COMPANION_LOG, 'a');
+  const child = spawn(process.execPath, [path.join(REPO, 'bin', 'mcli-companion.js')], {
+    env, detached: true, stdio: ['ignore', out, out],
+  });
+  fs.writeFileSync(COMPANION_PID, String(child.pid));
+  child.unref();
+  try {
+    await waitFor(probeCompanion, 40, 250);
+    ok(`companion pid ${child.pid} — logs: ${COMPANION_LOG}`);
+  } catch {
+    warn(`companion did not respond in 10s — check ${COMPANION_LOG}`);
+  }
+}
+
+async function startTunnel() {
+  const cf = spawnSync('cloudflared', ['--version'], { encoding: 'utf8' });
+  if (cf.status !== 0) die('cloudflared not installed. install: pkg install cloudflared  (Termux) or see https://github.com/cloudflare/cloudflared/releases');
+  if (isAlive(TUNNEL_PID)) {
+    ok(`tunnel already running (pid ${readPid(TUNNEL_PID)})`);
+    if (fs.existsSync(TUNNEL_URL_F)) ok(`public: ${fs.readFileSync(TUNNEL_URL_F, 'utf8').trim()}`);
+    return;
+  }
+  log(`starting cloudflared quick-tunnel → ${HOST}:${PORT}`);
+  fs.writeFileSync(TUNNEL_LOG, '');
+  const out = fs.openSync(TUNNEL_LOG, 'a');
+  const child = spawn('cloudflared', ['tunnel', '--no-autoupdate', '--url', `http://${HOST}:${PORT}`], {
+    detached: true, stdio: ['ignore', out, out],
+  });
+  fs.writeFileSync(TUNNEL_PID, String(child.pid));
+  child.unref();
+  // Scrape the URL from log
+  let url = '';
+  try {
+    url = await waitFor(() => {
+      const s = fs.readFileSync(TUNNEL_LOG, 'utf8');
+      const m = s.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+      return m ? m[0] : null;
+    }, 60, 300);
+  } catch {}
+  if (!url) { warn(`tunnel URL not yet in log — check ${TUNNEL_LOG}`); return; }
+  const pub = urlWithArgs(url + '/');
+  fs.writeFileSync(TUNNEL_URL_F, pub);
+  ok(`public: ${pub}`);
+}
+
+(async () => {
+  if (statusMode) {
+    const compAlive = isAlive(COMPANION_PID);
+    const tunAlive  = isAlive(TUNNEL_PID);
+    console.log(`companion: ${compAlive ? `up (pid ${readPid(COMPANION_PID)})` : 'down'}`);
+    console.log(`tunnel:    ${tunAlive  ? `up (pid ${readPid(TUNNEL_PID)})`  : 'down'}`);
+    if (fs.existsSync(TUNNEL_URL_F)) console.log(`public:    ${fs.readFileSync(TUNNEL_URL_F, 'utf8').trim()}`);
+    console.log(`local:     http://${HOST}:${PORT}/`);
+    return;
+  }
+  await startCompanion();
+  const local = urlWithArgs(`http://${HOST}:${PORT}/`);
+  ok(`local:  ${local}`);
+  if (useTunnel) await startTunnel();
+  // Termux niceness: offer to open in browser (only for local path).
+  if (!useTunnel && spawnSync('command', ['-v', 'termux-open-url'], { shell: true }).status === 0) {
+    log('opening in browser…');
+    spawn('termux-open-url', [local], { stdio: 'ignore', detached: true }).unref();
+  }
+  log(`state: ${STATE_DIR}`);
+  log(`stop:  mcli-term --stop`);
+})().catch((e) => die(e.stack || e.message));

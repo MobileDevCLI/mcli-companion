@@ -1,15 +1,19 @@
 {
   "name": "mcli-companion",
-  "version": "1.1.2",
-  "description": "Local runtime for mcli.mobilecli.com — hosts your Claude Code / Codex / Gemini CLI as a WebSocket that the browser tab talks to.",
+  "version": "1.2.0",
+  "description": "Local runtime that hosts your Claude Code / Codex / Gemini / gh / Grok CLI as a WebSocket + self-hosted browser terminal. Any device via cloudflared tunnel.",
   "keywords": [
     "claude",
     "claude-code",
     "codex",
     "gemini",
+    "gh",
+    "grok",
     "cli",
     "companion",
     "websocket",
+    "xterm",
+    "browser-terminal",
     "mobilecli"
   ],
   "homepage": "https://mcli.mobilecli.com",
@@ -24,11 +28,13 @@
   "license": "MIT",
   "type": "commonjs",
   "bin": {
-    "mcli-companion": "bin/mcli-companion.js"
+    "mcli-companion": "bin/mcli-companion.js",
+    "mcli-term": "bin/mcli-term"
   },
   "files": [
     "bin/",
     "lib/",
+    "web/",
     "README.md",
     "LICENSE"
   ],
@@ -40,6 +46,7 @@
     "ws": "^8.16.0"
   },
   "scripts": {
-    "test": "node tests/pty.test.cjs"
+    "test": "node tests/pty.test.cjs",
+    "start": "node bin/mcli-companion.js"
   }
 }
