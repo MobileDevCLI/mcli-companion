@@ -1,6 +1,6 @@
 {
   "name": "mcli-companion",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Local runtime that hosts your Claude Code / Codex / Gemini / gh / Grok CLI as a WebSocket + self-hosted browser terminal. Any device via cloudflared tunnel.",
   "keywords": [
     "claude",
